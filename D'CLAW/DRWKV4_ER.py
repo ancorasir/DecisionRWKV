@@ -86,7 +86,7 @@ class TrainConfig:
     batch_size: int = 64
     update_steps: int = 10000
     warmup_steps: int = 1000
-    reward_scale: float = 1  # 1000 normalization for rewards/returns
+    reward_scale: float = 1  
     num_workers: int = 4
     # evaluation params
 
@@ -142,45 +142,45 @@ def RUN_CUDA(B, T, C, w, u, k, v):
 class RWKV_TimeMix(torch.jit.ScriptModule):
     def __init__(self, layer_id):
         super().__init__()
-        self.layer_id = layer_id  # 当前layer id
-        self.ctx_len = TrainConfig.seq_len  # 最长文本长度
-        self.n_embd = TrainConfig.embedding_dim  # hidden_state 维度
+        self.layer_id = layer_id  
+        self.ctx_len = TrainConfig.seq_len  
+        self.n_embd = TrainConfig.embedding_dim  
 
-        with torch.no_grad():  # fancy init
+        with torch.no_grad():  
 
-            ratio_0_to_1 = (layer_id / (TrainConfig.num_layers - 1))  # 0 to 1   w的  l / (L - 1)
+            ratio_0_to_1 = (layer_id / (TrainConfig.num_layers - 1))  
 
-            ratio_1_to_almost0 = (1.0 - (layer_id / TrainConfig.num_layers))  # 1 to ~0   u(mu)的  1-（l/L）
+            ratio_1_to_almost0 = (1.0 - (layer_id / TrainConfig.num_layers))  
 
-            # fancy time_decay
-            decay_speed = torch.ones(self.n_embd)  # 维度的位置编码 [hidden_state_size]
-            for h in range(self.n_embd):  # 按隐藏维度循环每一个位置
+            
+            decay_speed = torch.ones(self.n_embd)  
+            for h in range(self.n_embd): 
 
                 decay_speed[h] = -5 + 8 * (h / (self.n_embd - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
             self.time_decay = nn.Parameter(decay_speed)
 
-            # fancy time_first 对应 论文中的bonus
+      
 
             zigzag = (torch.tensor([(i + 1) % 3 - 1 for i in range(self.n_embd)]) * 0.5)
             self.time_first = nn.Parameter(torch.ones(self.n_embd) * math.log(0.3) + zigzag)
 
-            # fancy time_mix 对应公式中的(11-13)
+            
             x = torch.ones(1, 1, TrainConfig.embedding_dim)
             for i in range(TrainConfig.embedding_dim):
 
                 x[0, 0, i] = i / TrainConfig.embedding_dim
-            self.time_mix_k = nn.Parameter(torch.pow(x, ratio_1_to_almost0))  # 对应 U(mu)_ki
-            self.time_mix_v = nn.Parameter(torch.pow(x, ratio_1_to_almost0) + 0.3 * ratio_0_to_1)  # 对应 U(mu)_Vi
-            self.time_mix_r = nn.Parameter(torch.pow(x, 0.5 * ratio_1_to_almost0))  # 对应 U(mu)_ri
+            self.time_mix_k = nn.Parameter(torch.pow(x, ratio_1_to_almost0))  
+            self.time_mix_v = nn.Parameter(torch.pow(x, ratio_1_to_almost0) + 0.3 * ratio_0_to_1) 
+            self.time_mix_r = nn.Parameter(torch.pow(x, 0.5 * ratio_1_to_almost0))  
 
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
 
-        # 定义 Wr Wk Wv
+    
         self.key = nn.Linear(TrainConfig.embedding_dim, self.n_embd, bias=False)
         self.value = nn.Linear(TrainConfig.embedding_dim, self.n_embd, bias=False)
         self.receptance = nn.Linear(TrainConfig.embedding_dim, self.n_embd, bias=False)
 
-        # 定义 Wo
+
         self.output = nn.Linear(self.n_embd, TrainConfig.embedding_dim, bias=False)
         self.key.scale_init = 0
         self.receptance.scale_init = 0
@@ -188,39 +188,36 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def jit_func(self, x):
-        """C++ 调用"""
-        # Mix x with the previous timestep to produce xk, xv, xr
-        xx = self.time_shift(x)  # X_t-1
-        xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)  # 公式 (12) 中的 括号部分
-        xv = x * self.time_mix_v + xx * (1 - self.time_mix_v)  # 公式 (13) 中的 括号部分
-        xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)  # 公式 (11) 中的 括号部分
+        xx = self.time_shift(x) 
+        xk = x * self.time_mix_k + xx * (1 - self.time_mix_k) 
+        xv = x * self.time_mix_v + xx * (1 - self.time_mix_v)  
+        xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)  
 
-        # Use xk, xv, xr to produce k, v, r
-        k = self.key(xk)  # 公式 (12) 中的K_t
-        v = self.value(xv)  # 公式 (13) 中的V_t
-        r = self.receptance(xr)  # 公式 (11) 中的R_t
-        sr = torch.sigmoid(r)  # 公式 (15) 中的sigmoid_Rt
+        k = self.key(xk) 
+        v = self.value(xv)  
+        r = self.receptance(xr) 
+        sr = torch.sigmoid(r)  
 
         return sr, k, v
 
     def forward(self, x):
-        B, T, C = x.size()  # x = (Batch,Time,Channel)  <=>   batch_size sentence_len hidden_size
+        B, T, C = x.size()  
         sr, k, v = self.jit_func(x)
         rwkv = sr * RUN_CUDA(B, T, C, self.time_decay, self.time_first, k, v)
-        rwkv = self.output(rwkv)  # 对应公式 (15)
+        rwkv = self.output(rwkv)  
         return rwkv
 
 
 class RWKV_ChannelMix(torch.jit.ScriptModule):
     def __init__(self, layer_id):
         super().__init__()
-        self.layer_id = layer_id  # layer id
+        self.layer_id = layer_id  
 
-        # 平移
+
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
 
-        with torch.no_grad():  # fancy init of time_mix
-            ratio_1_to_almost0 = (1.0 - (layer_id / TrainConfig.num_layers))  # 1 to ~0
+        with torch.no_grad(): 
+            ratio_1_to_almost0 = (1.0 - (layer_id / TrainConfig.num_layers))  
 
             x = torch.ones(1, 1, TrainConfig.embedding_dim)
             for i in range(TrainConfig.embedding_dim):
@@ -230,9 +227,9 @@ class RWKV_ChannelMix(torch.jit.ScriptModule):
             self.time_mix_r = nn.Parameter(torch.pow(x, ratio_1_to_almost0))
 
         hidden_sz = 4 * TrainConfig.embedding_dim
-        self.key = nn.Linear(TrainConfig.embedding_dim, hidden_sz, bias=False)  # 对应公式(17) 中的 W_k
-        self.receptance = nn.Linear(TrainConfig.embedding_dim, TrainConfig.embedding_dim, bias=False)  # 对应公式(16) 中的 W_r
-        self.value = nn.Linear(hidden_sz, TrainConfig.embedding_dim, bias=False)  # 对应公式(18) 中的 W_v
+        self.key = nn.Linear(TrainConfig.embedding_dim, hidden_sz, bias=False)  
+        self.receptance = nn.Linear(TrainConfig.embedding_dim, TrainConfig.embedding_dim, bias=False)  
+        self.value = nn.Linear(hidden_sz, TrainConfig.embedding_dim, bias=False)  
 
         self.value.scale_init = 0
         self.receptance.scale_init = 0
@@ -247,7 +244,7 @@ class RWKV_ChannelMix(torch.jit.ScriptModule):
         k = torch.square(torch.relu(k))
         kv = self.value(k)
 
-        rkv = torch.sigmoid(self.receptance(xr)) * kv  # 公式（18）中
+        rkv = torch.sigmoid(self.receptance(xr)) * kv  
         return rkv
 
 # general utils
@@ -280,7 +277,6 @@ def wrap_env(
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
 
-# some utils functionalities specific for Decision Transformer
 def pad_along_axis(
     arr: np.ndarray, pad_to: int, axis: int = 0, fill_value: float = 0.0
 ) -> np.ndarray:
@@ -302,8 +298,8 @@ def discounted_cumsum(x: np.ndarray, gamma: float) -> np.ndarray:
 def load_trajectories(
     env_name: str, gamma: float = 1.0
 ) -> Tuple[List[DefaultDict[str, np.ndarray]], Dict[str, Any]]:
-    info_path = "/home/dong/LRL/dclaw/dataset_SAC_DClaw/"+env_name+"_info.pkl"
-    traj_path = "/home/dong/LRL/dclaw/dataset_SAC_DClaw/" + env_name + "_traj.pkl"
+    info_path = "dataset_SAC_DClaw/"+env_name+"_info.pkl"
+    traj_path = "dataset_SAC_DClaw/" + env_name + "_traj.pkl"
     with open(info_path, "rb") as f:
             info = pickle.load(f)
     with open(traj_path, "rb") as f:
@@ -319,13 +315,10 @@ class SequenceDataset(IterableDataset):
 
         self.state_mean = info["obs_mean"]
         self.state_std = info["obs_std"]
-        # https://github.com/kzl/decision-transformer/blob/e2d82e68f330c00f763507b3b01d774740bee53f/gym/experiment.py#L116 # noqa
         self.sample_prob = info["traj_lens"] / info["traj_lens"].sum()
 
     def __prepare_sample(self, traj_idx, start_idx):
         traj = self.dataset[traj_idx]
-
-        # https://github.com/kzl/decision-transformer/blob/e2d82e68f330c00f763507b3b01d774740bee53f/gym/experiment.py#L128 # noqa
         states = traj["states"][start_idx : start_idx + self.seq_len]
         actions = traj["actions"][start_idx : start_idx + self.seq_len]
         returns = traj["returns"][start_idx : start_idx + self.seq_len]
@@ -333,7 +326,6 @@ class SequenceDataset(IterableDataset):
 
         states = (states - self.state_mean) / self.state_std
         returns = returns * self.reward_scale
-        # pad up to seq_len if needed
         mask = np.hstack(
             [np.ones(states.shape[0]), np.zeros(self.seq_len - states.shape[0])]
         )
@@ -350,14 +342,12 @@ class SequenceDataset(IterableDataset):
             start_idx = random.randint(0, self.dataset[traj_idx]["rewards"].shape[0] - 1)
             yield self.__prepare_sample(traj_idx, start_idx)
 
-# Decision Transformer implementation
-
 class Block(nn.Module):
     """一个RWKV块"""
 
     def __init__(self, layer_id):
         super().__init__()
-        self.layer_id = layer_id  # 当前layer的id
+        self.layer_id = layer_id  
         self.ln1 = nn.LayerNorm(TrainConfig.embedding_dim)
         self.ln2 = nn.LayerNorm(TrainConfig.embedding_dim)
         self.Time_mix = RWKV_TimeMix(layer_id)
@@ -390,7 +380,6 @@ class DecisionRWKV(nn.Module):
         self.emb_norm = nn.LayerNorm(embedding_dim)
 
         self.out_norm = nn.LayerNorm(embedding_dim)
-        # additional seq_len embeddings for padding timesteps
         self.timestep_emb = nn.Embedding(episode_len + seq_len, embedding_dim)
         self.state_emb = nn.Linear(state_dim, embedding_dim)
         self.action_emb = nn.Linear(action_dim, embedding_dim)
@@ -429,7 +418,6 @@ class DecisionRWKV(nn.Module):
         batch_size, seq_len = states.shape[0], states.shape[1]
         # [batch_size, seq_len, emb_dim]
         time_emb = self.timestep_emb(time_steps)
-        # print(states)
         state_emb = self.state_emb(states) + time_emb
         act_emb = self.action_emb(actions) + time_emb
         returns_emb = self.return_emb(returns_to_go.unsqueeze(-1)) + time_emb
@@ -447,16 +435,14 @@ class DecisionRWKV(nn.Module):
                 .permute(0, 2, 1)
                 .reshape(batch_size, 3 * seq_len)
             )
-        # LayerNorm and Dropout (!!!) as in original implementation,
-        # while minGPT & huggingface uses only embedding dropout
+
         out = self.emb_norm(sequence)
         out = self.emb_drop(out)
         for block in self.blocks:
             out = block(out)
 
         out = self.out_norm(out)
-        # [batch_size, seq_len, action_dim]
-        # predict actions only from state embeddings
+
         out = self.action_head(out[:, 1::3]) * self.max_action
 
         return out
@@ -520,7 +506,7 @@ def eval_rollout(
 class ReplayBuffer:
     def __init__(self, buffer_size):
         self.buffer_size = buffer_size
-        self.buffer = defaultdict(list)  # 使用字典来存储不同任务的经验
+        self.buffer = defaultdict(list)  
 
     def add(self, task_id, experience):
         task_buffer = self.buffer[task_id]
@@ -530,11 +516,11 @@ class ReplayBuffer:
 
     def sample(self, batch_size):
         samples = []
-        per_task_batch_size = max(1, batch_size // len(self.buffer))  # 确保每个任务至少有一个样本
+        per_task_batch_size = max(1, batch_size // len(self.buffer))  
         for task_id, task_buffer in self.buffer.items():
             task_samples = random.sample(task_buffer, min(len(task_buffer), per_task_batch_size))
             samples.extend(task_samples)
-        return samples[:batch_size]  # 如果样本过多，只取需要的数量
+        return samples[:batch_size] 
 
 
 @pyrallis.wrap()
@@ -574,20 +560,19 @@ def train(config: TrainConfig, model, envName, replay_buffer, task_id):
         states, actions, returns, time_steps, mask = [b.to(config.device) for b in batch]
         for i in range(states.shape[0]):
             replay_buffer.add(task_id, (states[i], actions[i], returns[i], time_steps[i], mask[i]))
-        # 从回放缓冲区中采样经验
-        replay_samples = replay_buffer.sample(config.batch_size // 2)  # 假设一半的数据来自回放缓冲区
+
+        replay_samples = replay_buffer.sample(config.batch_size // 2) 
         replay_states, replay_actions, replay_returns, replay_time_steps, replay_mask = map(
             lambda x: torch.stack(x).to(config.device), zip(*replay_samples)
         )
 
-        # 将当前任务的数据和回放缓冲区的数据合并
+
         states = torch.cat((states, replay_states), dim=0)
         actions = torch.cat((actions, replay_actions), dim=0)
         returns = torch.cat((returns, replay_returns), dim=0)
         time_steps = torch.cat((time_steps, replay_time_steps), dim=0)
         mask = torch.cat((mask, replay_mask), dim=0)
 
-        # True value indicates that the corresponding key value will be ignored
         padding_mask = ~mask.to(torch.bool)
 
         predicted_actions = model(

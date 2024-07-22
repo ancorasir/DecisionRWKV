@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, IterableDataset
-from tqdm.auto import tqdm, trange  # noqa
+from tqdm.auto import tqdm, trange  
 import pickle
 import matplotlib.pyplot as plt
 import numpy as np
@@ -43,7 +43,7 @@ class TrainConfig:
     batch_size: int = 64
     update_steps: int = 10000
     warmup_steps: int = 1000
-    reward_scale: float = 1  # 1000 normalization for rewards/returns
+    reward_scale: float = 1  
     num_workers: int = 4
     # evaluation params
 
@@ -92,7 +92,6 @@ def wrap_env(
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
 
-# some utils functionalities specific for Decision Transformer
 def pad_along_axis(
     arr: np.ndarray, pad_to: int, axis: int = 0, fill_value: float = 0.0
 ) -> np.ndarray:
@@ -114,8 +113,8 @@ def discounted_cumsum(x: np.ndarray, gamma: float) -> np.ndarray:
 def load_trajectories(
     env_name: str, gamma: float = 1.0
 ) -> Tuple[List[DefaultDict[str, np.ndarray]], Dict[str, Any]]:
-    info_path = "/home/dong/LRL/dclaw/dataset_SAC_DClaw/"+env_name+"_info.pkl"
-    traj_path = "/home/dong/LRL/dclaw/dataset_SAC_DClaw/" + env_name + "_traj.pkl"
+    info_path = "dataset_SAC_DClaw/"+env_name+"_info.pkl"
+    traj_path = "dataset_SAC_DClaw/" + env_name + "_traj.pkl"
     with open(info_path, "rb") as f:
             info = pickle.load(f)
     with open(traj_path, "rb") as f:
@@ -131,13 +130,11 @@ class SequenceDataset(IterableDataset):
 
         self.state_mean = info["obs_mean"]
         self.state_std = info["obs_std"]
-        # https://github.com/kzl/decision-transformer/blob/e2d82e68f330c00f763507b3b01d774740bee53f/gym/experiment.py#L116 # noqa
         self.sample_prob = info["traj_lens"] / info["traj_lens"].sum()
 
     def __prepare_sample(self, traj_idx, start_idx):
         traj = self.dataset[traj_idx]
 
-        # https://github.com/kzl/decision-transformer/blob/e2d82e68f330c00f763507b3b01d774740bee53f/gym/experiment.py#L128 # noqa
         states = traj["states"][start_idx : start_idx + self.seq_len]
         actions = traj["actions"][start_idx : start_idx + self.seq_len]
         returns = traj["returns"][start_idx : start_idx + self.seq_len]
@@ -145,7 +142,6 @@ class SequenceDataset(IterableDataset):
 
         states = (states - self.state_mean) / self.state_std
         returns = returns * self.reward_scale
-        # pad up to seq_len if needed
         mask = np.hstack(
             [np.ones(states.shape[0]), np.zeros(self.seq_len - states.shape[0])]
         )
@@ -162,7 +158,6 @@ class SequenceDataset(IterableDataset):
             start_idx = random.randint(0, self.dataset[traj_idx]["rewards"].shape[0] - 1)
             yield self.__prepare_sample(traj_idx, start_idx)
 
-# Decision Transformer implementation
 class TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -186,13 +181,11 @@ class TransformerBlock(nn.Module):
             nn.Linear(4 * embedding_dim, embedding_dim),
             nn.Dropout(residual_dropout),
         )
-        # True value indicates that the corresponding position is not allowed to attend
         self.register_buffer(
             "causal_mask", ~torch.tril(torch.ones(seq_len, seq_len)).to(bool)
         )
         self.seq_len = seq_len
 
-    # [batch_size, seq_len, emb_dim] -> [batch_size, seq_len, emb_dim]
     def forward(
         self, x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -207,9 +200,7 @@ class TransformerBlock(nn.Module):
             key_padding_mask=padding_mask,
             need_weights=False,
         )[0]
-        # by default pytorch attention does not use dropout
-        # after final attention weights projection, while minGPT does:
-        # https://github.com/karpathy/minGPT/blob/7218bcfa527c65f164de791099de715b81a95106/mingpt/model.py#L70 # noqa
+
         x = x + self.drop(attention_out)
         x = x + self.mlp(self.norm2(x))
         return x
@@ -235,7 +226,6 @@ class DecisionTransformer(nn.Module):
         self.emb_norm = nn.LayerNorm(embedding_dim)
 
         self.out_norm = nn.LayerNorm(embedding_dim)
-        # additional seq_len embeddings for padding timesteps
         self.timestep_emb = nn.Embedding(episode_len + seq_len, embedding_dim)
         self.state_emb = nn.Linear(state_dim, embedding_dim)
         self.action_emb = nn.Linear(action_dim, embedding_dim)
@@ -282,42 +272,34 @@ class DecisionTransformer(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,  # [batch_size, seq_len]
     ) -> torch.FloatTensor:
         batch_size, seq_len = states.shape[0], states.shape[1]
-        # [batch_size, seq_len, emb_dim]
         time_emb = self.timestep_emb(time_steps)
-        # print(states)
         state_emb = self.state_emb(states) + time_emb
         act_emb = self.action_emb(actions) + time_emb
         returns_emb = self.return_emb(returns_to_go.unsqueeze(-1)) + time_emb
 
-        # [batch_size, seq_len * 3, emb_dim], (r_0, s_0, a_0, r_1, s_1, a_1, ...)
         sequence = (
             torch.stack([returns_emb, state_emb, act_emb], dim=1)
             .permute(0, 2, 1, 3)
             .reshape(batch_size, 3 * seq_len, self.embedding_dim)
         )
         if padding_mask is not None:
-            # [batch_size, seq_len * 3], stack mask identically to fit the sequence
             padding_mask = (
                 torch.stack([padding_mask, padding_mask, padding_mask], dim=1)
                 .permute(0, 2, 1)
                 .reshape(batch_size, 3 * seq_len)
             )
-        # LayerNorm and Dropout (!!!) as in original implementation,
-        # while minGPT & huggingface uses only embedding dropout
+
         out = self.emb_norm(sequence)
         out = self.emb_drop(out)
         for block in self.blocks:
             out = block(out, padding_mask=padding_mask)
 
         out = self.out_norm(out)
-        # [batch_size, seq_len, action_dim]
-        # predict actions only from state embeddings
         out = self.action_head(out[:, 1::3]) * self.max_action
 
         return out
 
 
-# Training and evaluation logic
 @torch.no_grad()
 def eval_rollout(
     model: DecisionTransformer,
@@ -339,27 +321,20 @@ def eval_rollout(
     states[:, 0] = torch.as_tensor(env.reset(), device=device)
     returns[:, 0] = torch.as_tensor(target_return, device=device)
     score = 0
-    # cannot step higher than model episode len, as timestep embeddings will crash
     episode_return, episode_len = 0.0, 0.0
     for step in range(model.episode_len):
-        # first select history up to step, then select last seq_len states,
-        # step + 1 as : operator is not inclusive, last action is dummy with zeros
-        # (as model will predict last, actual last values are not important)
-        # print(actions[:, : step + 1][:, -model.seq_len :])
-        predicted_actions = model(  # fix this noqa!!!
+
+        predicted_actions = model(  
             states[:, : step + 1][:, -model.seq_len :],
             actions[:, : step + 1][:, -model.seq_len :],
             returns[:, : step + 1][:, -model.seq_len :],
             time_steps[:, : step + 1][:, -model.seq_len :],
         )
-        # print(predicted_actions)
+
         predicted_action = predicted_actions[0, -1].cpu().numpy()
         next_state, reward, done, info = env.step(predicted_action)
 
-        # print(reward)
         score += reward
-        # env.render()
-        # at step t, we predict a_t, get s_{t + 1}, r_{t + 1}
         actions[:, step] = torch.as_tensor(predicted_action)
         states[:, step + 1] = torch.as_tensor(next_state)
         returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
@@ -375,7 +350,7 @@ def eval_rollout(
 class ReplayBuffer:
     def __init__(self, buffer_size):
         self.buffer_size = buffer_size
-        self.buffer = defaultdict(list)  # 使用字典来存储不同任务的经验
+        self.buffer = defaultdict(list)  
 
     def add(self, task_id, experience):
         task_buffer = self.buffer[task_id]
@@ -385,11 +360,11 @@ class ReplayBuffer:
 
     def sample(self, batch_size):
         samples = []
-        per_task_batch_size = max(1, batch_size // len(self.buffer))  # 确保每个任务至少有一个样本
+        per_task_batch_size = max(1, batch_size // len(self.buffer))  
         for task_id, task_buffer in self.buffer.items():
             task_samples = random.sample(task_buffer, min(len(task_buffer), per_task_batch_size))
             samples.extend(task_samples)
-        return samples[:batch_size]  # 如果样本过多，只取需要的数量
+        return samples[:batch_size]  
 
 
 @pyrallis.wrap()
@@ -397,7 +372,6 @@ def train(config: TrainConfig, model, envName, replay_buffer, task_id):
     set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
     plot_X = []
     plot_Y = []
-    # data & dataloader setup
     dataset = SequenceDataset(
         envName, seq_len=config.seq_len, reward_scale=config.reward_scale
     )
@@ -408,7 +382,6 @@ def train(config: TrainConfig, model, envName, replay_buffer, task_id):
         pin_memory=True,
         num_workers=config.num_workers,
     )
-    # evaluation environment with state & reward preprocessing (as in dataset above)
 
     optim = torch.optim.AdamW(
         model.parameters(),
@@ -420,7 +393,6 @@ def train(config: TrainConfig, model, envName, replay_buffer, task_id):
         optim,
         lambda steps: min((steps + 1) / config.warmup_steps, 1),
     )
-    # save config to the checkpoint
 
 
     print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
@@ -430,20 +402,18 @@ def train(config: TrainConfig, model, envName, replay_buffer, task_id):
         states, actions, returns, time_steps, mask = [b.to(config.device) for b in batch]
         for i in range(states.shape[0]):
             replay_buffer.add(task_id, (states[i], actions[i], returns[i], time_steps[i], mask[i]))
-        # 从回放缓冲区中采样经验
-        replay_samples = replay_buffer.sample(config.batch_size // 2)  # 假设一半的数据来自回放缓冲区
+
+        replay_samples = replay_buffer.sample(config.batch_size // 2)  
         replay_states, replay_actions, replay_returns, replay_time_steps, replay_mask = map(
             lambda x: torch.stack(x).to(config.device), zip(*replay_samples)
         )
 
-        # 将当前任务的数据和回放缓冲区的数据合并
         states = torch.cat((states, replay_states), dim=0)
         actions = torch.cat((actions, replay_actions), dim=0)
         returns = torch.cat((returns, replay_returns), dim=0)
         time_steps = torch.cat((time_steps, replay_time_steps), dim=0)
         mask = torch.cat((mask, replay_mask), dim=0)
 
-        # True value indicates that the corresponding key value will be ignored
         padding_mask = ~mask.to(torch.bool)
 
         predicted_actions = model(
@@ -454,9 +424,7 @@ def train(config: TrainConfig, model, envName, replay_buffer, task_id):
             padding_mask=padding_mask,
         )
         loss = F.mse_loss(predicted_actions, actions.detach(), reduction="none")
-        # [batch_size, seq_len, action_dim] * [batch_size, seq_len, 1]
         loss = (loss * mask.unsqueeze(-1)).mean()
-        # print("loss:",loss)
         optim.zero_grad()
         loss.backward()
         if config.clip_grad is not None:
@@ -464,7 +432,6 @@ def train(config: TrainConfig, model, envName, replay_buffer, task_id):
         optim.step()
         scheduler.step()
 
-        # validation in the env for the actual online performance
         if step % config.eval_every == 0 or step == config.update_steps-1:
             model.eval()
 
@@ -509,7 +476,6 @@ def train_all(config: TrainConfig):
     set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
     config.state_dim = 21
     config.action_dim = 9
-    # Initialize the model once and train on multiple environments
     model = DecisionTransformer(
         state_dim=config.state_dim,
         action_dim=config.action_dim,
@@ -523,7 +489,6 @@ def train_all(config: TrainConfig):
         embedding_dropout=config.embedding_dropout,
         max_action=config.max_action,
     ).to(config.device)
-    # Train on each environment in the list
     env_list = ["DClawTurnFixedT0-v0", "DClawTurnFixedT1-v0", "DClawTurnFixedT2-v0", "DClawTurnFixedT3-v0",
                 "DClawTurnFixedT4-v0", "DClawTurnFixedT5-v0", "DClawTurnFixedT6-v0", "DClawTurnFixedT7-v0",
                 "DClawTurnFixedT8-v0", "DClawTurnFixedT9-v0"]
@@ -544,9 +509,9 @@ def train_all(config: TrainConfig):
         print("saving....checkpoint in" + os.path.join(config.checkpoints_path, checkpoints_path+"-checkpoint.pt"))
 
 if __name__ == "__main__":
-    # TrainConfig.train_seed = 0
-    # train_all()
-    # TrainConfig.train_seed = 10
-    # train_all()
+    TrainConfig.train_seed = 0
+    train_all()
+    TrainConfig.train_seed = 10
+    train_all()
     TrainConfig.train_seed = 42
     train_all()
