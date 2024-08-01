@@ -5,7 +5,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Any, DefaultDict, Dict, List, Optional, Tuple, Union
 
-import d4rl  # noqa
+import d4rl  
 import gym
 import numpy as np
 import pyrallis
@@ -14,7 +14,8 @@ import torch.nn as nn
 import wandb
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, IterableDataset
-from tqdm.auto import tqdm, trange  # noqa
+from tqdm.auto import tqdm, trange 
+
 
 class L2Wrap(torch.autograd.Function):
     @staticmethod
@@ -46,13 +47,11 @@ wkv5_cuda = load(name="wkv5", sources=["cuda/wkv5_op.cpp", f"cuda/wkv5_cuda.cu"]
 
 @dataclass
 class TrainConfig:
-    # wandb params
     project: str = "D-RWKV"
     group: str = "Gym-MuJoCo"
-    name: str = "halfcheetah-medium-v2"
-    # model params
-    embedding_dim: int = 256
-    num_layers: int = 6
+    name: str = "DRWKV5"
+    embedding_dim: int = 128
+    num_layers: int = 12
     num_heads: int = 1
     seq_len: int = 20
     episode_len: int = 1000
@@ -60,25 +59,22 @@ class TrainConfig:
     residual_dropout: float = 0.1
     embedding_dropout: float = 0.1
     max_action: float = 1.0
-    # training params
     env_name: str = "halfcheetah-medium-v2"
     learning_rate: float = 1e-4
     betas: Tuple[float, float] = (0.9, 0.999)
     weight_decay: float = 1e-4
     clip_grad: Optional[float] = 0.25
     batch_size: int = 64
-    update_steps: int = 500
-    warmup_steps: int = 100
+    update_steps: int = 100_00
+    warmup_steps: int = 10_00
     reward_scale: float = 0.001
     num_workers: int = 4
-    # evaluation params
-    target_returns: Tuple[float, ...] = (12000.0, 6000.0)
-    eval_episodes: int = 1
-    eval_every: int = 100
-    # general params
-    checkpoints_path: Optional[str] = "/home/yujiandong/LRL/d4rl/model/"
+    target_return: float = 12000
+    eval_episodes: int = 10
+    eval_every: int = 10000
+    checkpoints_path: Optional[str] = None
     deterministic_torch: bool = False
-    train_seed: int = 10
+    train_seed: int = 42
     eval_seed: int = 42
     device: str = "cuda"
 
@@ -86,7 +82,6 @@ class TrainConfig:
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
-
 
 class WKV_5(torch.autograd.Function):
     @staticmethod
@@ -108,7 +103,7 @@ class WKV_5(torch.autograd.Function):
             eew = (torch.exp(ew)).contiguous()
             ctx.save_for_backward(r, k, v, eew, ew, u)
             y = torch.empty((B, T, C), device=r.device, dtype=torch.float,
-                            memory_format=torch.contiguous_format)  # .uniform_(-1, 1)
+                            memory_format=torch.contiguous_format)  
             wkv5_cuda.forward(B, T, C, H, r, k, v, eew, u, y)
             return y
 
@@ -123,15 +118,15 @@ class WKV_5(torch.autograd.Function):
             assert gy.is_contiguous()
             r, k, v, eew, ew, u = ctx.saved_tensors
             gr = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=torch.float,
-                             memory_format=torch.contiguous_format)  # .uniform_(-1, 1)
+                             memory_format=torch.contiguous_format)  
             gk = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=torch.float,
-                             memory_format=torch.contiguous_format)  # .uniform_(-1, 1)
+                             memory_format=torch.contiguous_format)  
             gv = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=torch.float,
-                             memory_format=torch.contiguous_format)  # .uniform_(-1, 1)
+                             memory_format=torch.contiguous_format)  
             gw = torch.empty((B, C), device=gy.device, requires_grad=False, dtype=torch.float,
-                             memory_format=torch.contiguous_format)  # .uniform_(-1, 1)
+                             memory_format=torch.contiguous_format)  
             gu = torch.empty((B, C), device=gy.device, requires_grad=False, dtype=torch.float,
-                             memory_format=torch.contiguous_format)  # .uniform_(-1, 1)
+                             memory_format=torch.contiguous_format)  
             wkv5_cuda.backward(B, T, C, H, r, k, v, eew, ew, u, gy, gr, gk, gv, gw, gu)
             gw = torch.sum(gw, 0).view(H, C // H)
             gu = torch.sum(gu, 0).view(H, C // H)
@@ -141,36 +136,32 @@ class WKV_5(torch.autograd.Function):
 def RUN_CUDA_RWKV5(B, T, C, H, r, k, v, w, u):
     return WKV_5.apply(B, T, C, H, r, k, v, w, u)
 
-
 class RWKV_TimeMix(torch.jit.ScriptModule):
     def __init__(self, layer_id):
         super().__init__()
-        self.layer_id = layer_id  # 当前layer id
-        self.n_embd = TrainConfig.embedding_dim  # hidden_state 维度
+        self.layer_id = layer_id  
+        self.n_embd = TrainConfig.embedding_dim  
         self.head_size = 64
         self.dim_att = TrainConfig.embedding_dim
-        assert HEAD_SIZE == self.head_size  # change HEAD_SIZE to match args.head_size_a
+        assert HEAD_SIZE == self.head_size  
         self.n_head = self.dim_att // self.head_size
-        self.head_size_divisor = 8 #default
+        self.head_size_divisor = 8 
 
-        with torch.no_grad():  # fancy init
-            ratio_0_to_1 = layer_id / (TrainConfig.num_layers - 1)  # 0 to 1
-            ratio_1_to_almost0 = 1.0 - (layer_id / TrainConfig.num_layers)  # 1 to ~0
+        with torch.no_grad(): 
+            ratio_0_to_1 = layer_id / (TrainConfig.num_layers - 1)  
+            ratio_1_to_almost0 = 1.0 - (layer_id / TrainConfig.num_layers)  
             ddd = torch.ones(1, 1, TrainConfig.embedding_dim)
             for i in range(TrainConfig.embedding_dim):
                 ddd[0, 0, i] = i / TrainConfig.embedding_dim
-            # fancy time_mix
             self.time_mix_k = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
             self.time_mix_v = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0) + 0.3 * ratio_0_to_1)
             self.time_mix_r = nn.Parameter(torch.pow(ddd, 0.5 * ratio_1_to_almost0))
             self.time_mix_g = nn.Parameter(torch.pow(ddd, 0.5 * ratio_1_to_almost0))
 
-            # fancy time_decay
             decay_speed = torch.ones(self.dim_att)
             for n in range(self.dim_att):
                 decay_speed[n] = -6 + 5 * (n / (self.dim_att - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
             self.time_decay = nn.Parameter(decay_speed.reshape(self.n_head, self.head_size))
-            # print(layer_id, self.time_decay.flatten()[:3].cpu().numpy(), '...', self.time_decay.flatten()[-3:].cpu().numpy())
             tmp = torch.zeros(self.dim_att)
             for n in range(self.dim_att):
                 zigzag = ((n + 1) % 3 - 1) * 0.1
@@ -192,7 +183,7 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
     def jit_func(self, x):
         B, T, C = x.size()
 
-        xx = self.time_shift(x) # Mix x with the previous timestep to produce xk, xv, xr
+        xx = self.time_shift(x) 
         xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)
         xv = x * self.time_mix_v + xx * (1 - self.time_mix_v)
         xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)
@@ -229,13 +220,13 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
 class RWKV_ChannelMix(torch.jit.ScriptModule):
     def __init__(self, layer_id):
         super().__init__()
-        self.layer_id = layer_id  # layer id
+        self.layer_id = layer_id  
 
-        # 平移
+      
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
 
-        with torch.no_grad():  # fancy init of time_mix
-            ratio_1_to_almost0 = (1.0 - (layer_id / TrainConfig.num_layers))  # 1 to ~0
+        with torch.no_grad():  
+            ratio_1_to_almost0 = (1.0 - (layer_id / TrainConfig.num_layers))  
 
             x = torch.ones(1, 1, TrainConfig.embedding_dim)
             for i in range(TrainConfig.embedding_dim):
@@ -245,9 +236,9 @@ class RWKV_ChannelMix(torch.jit.ScriptModule):
             self.time_mix_r = nn.Parameter(torch.pow(x, ratio_1_to_almost0))
 
         hidden_sz = 4 * TrainConfig.embedding_dim
-        self.key = nn.Linear(TrainConfig.embedding_dim, hidden_sz, bias=False)  # 对应公式(17) 中的 W_k
-        self.receptance = nn.Linear(TrainConfig.embedding_dim, TrainConfig.embedding_dim, bias=False)  # 对应公式(16) 中的 W_r
-        self.value = nn.Linear(hidden_sz, TrainConfig.embedding_dim, bias=False)  # 对应公式(18) 中的 W_v
+        self.key = nn.Linear(TrainConfig.embedding_dim, hidden_sz, bias=False)  
+        self.receptance = nn.Linear(TrainConfig.embedding_dim, TrainConfig.embedding_dim, bias=False)  
+        self.value = nn.Linear(hidden_sz, TrainConfig.embedding_dim, bias=False)  
 
         self.value.scale_init = 0
         self.receptance.scale_init = 0
@@ -262,10 +253,9 @@ class RWKV_ChannelMix(torch.jit.ScriptModule):
         k = torch.square(torch.relu(k))
         kv = self.value(k)
 
-        rkv = torch.sigmoid(self.receptance(xr)) * kv  # 公式（18）中
+        rkv = torch.sigmoid(self.receptance(xr)) * kv  
         return rkv
 
-# general utils
 def set_seed(
     seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
 ):
@@ -308,7 +298,6 @@ def wrap_env(
     return env
 
 
-# some utils functionalities specific for Decision Transformer
 def pad_along_axis(
     arr: np.ndarray, pad_to: int, axis: int = 0, fill_value: float = 0.0
 ) -> np.ndarray:
@@ -343,16 +332,13 @@ def load_d4rl_trajectories(
 
         if dataset["terminals"][i] or dataset["timeouts"][i]:
             episode_data = {k: np.array(v, dtype=np.float32) for k, v in data_.items()}
-            # return-to-go if gamma=1.0, just discounted returns else
             episode_data["returns"] = discounted_cumsum(
                 episode_data["rewards"], gamma=gamma
             )
             traj.append(episode_data)
             traj_len.append(episode_data["actions"].shape[0])
-            # reset trajectory buffer
             data_ = defaultdict(list)
 
-    # needed for normalization, weighted sampling, other stats can be added also
     info = {
         "obs_mean": dataset["observations"].mean(0, keepdims=True),
         "obs_std": dataset["observations"].std(0, keepdims=True) + 1e-6,
@@ -369,12 +355,10 @@ class SequenceDataset(IterableDataset):
 
         self.state_mean = info["obs_mean"]
         self.state_std = info["obs_std"]
-        # https://github.com/kzl/decision-transformer/blob/e2d82e68f330c00f763507b3b01d774740bee53f/gym/experiment.py#L116 # noqa
         self.sample_prob = info["traj_lens"] / info["traj_lens"].sum()
 
     def __prepare_sample(self, traj_idx, start_idx):
         traj = self.dataset[traj_idx]
-        # https://github.com/kzl/decision-transformer/blob/e2d82e68f330c00f763507b3b01d774740bee53f/gym/experiment.py#L128 # noqa
         states = traj["observations"][start_idx : start_idx + self.seq_len]
         actions = traj["actions"][start_idx : start_idx + self.seq_len]
         returns = traj["returns"][start_idx : start_idx + self.seq_len]
@@ -382,7 +366,6 @@ class SequenceDataset(IterableDataset):
 
         states = (states - self.state_mean) / self.state_std
         returns = returns * self.reward_scale
-        # pad up to seq_len if needed
         mask = np.hstack(
             [np.ones(states.shape[0]), np.zeros(self.seq_len - states.shape[0])]
         )
@@ -399,12 +382,12 @@ class SequenceDataset(IterableDataset):
             start_idx = random.randint(0, self.dataset[traj_idx]["rewards"].shape[0] - 1)
             yield self.__prepare_sample(traj_idx, start_idx)
 
+
 class Block(nn.Module):
-    """一个RWKV块"""
 
     def __init__(self, layer_id):
         super().__init__()
-        self.layer_id = layer_id  # 当前layer的id
+        self.layer_id = layer_id  
         self.ln1 = nn.LayerNorm(TrainConfig.embedding_dim)
         self.ln2 = nn.LayerNorm(TrainConfig.embedding_dim)
         self.Time_mix = RWKV_TimeMix(layer_id)
@@ -436,7 +419,6 @@ class DecisionRWKV(nn.Module):
         self.emb_norm = nn.LayerNorm(embedding_dim)
 
         self.out_norm = nn.LayerNorm(embedding_dim)
-        # additional seq_len embeddings for padding timesteps
         self.timestep_emb = nn.Embedding(episode_len + seq_len, embedding_dim)
         self.state_emb = nn.Linear(state_dim, embedding_dim)
         self.action_emb = nn.Linear(action_dim, embedding_dim)
@@ -466,48 +448,40 @@ class DecisionRWKV(nn.Module):
 
     def forward(
         self,
-        states: torch.Tensor,  # [batch_size, seq_len, state_dim]
-        actions: torch.Tensor,  # [batch_size, seq_len, action_dim]
-        returns_to_go: torch.Tensor,  # [batch_size, seq_len]
-        time_steps: torch.Tensor,  # [batch_size, seq_len]
-        padding_mask: Optional[torch.Tensor] = None,  # [batch_size, seq_len]
+        states: torch.Tensor,  
+        actions: torch.Tensor,  
+        returns_to_go: torch.Tensor,  
+        time_steps: torch.Tensor, 
+        padding_mask: Optional[torch.Tensor] = None,  
     ) -> torch.FloatTensor:
         batch_size, seq_len = states.shape[0], states.shape[1]
-        # [batch_size, seq_len, emb_dim]
         time_emb = self.timestep_emb(time_steps)
         state_emb = self.state_emb(states) + time_emb
         act_emb = self.action_emb(actions) + time_emb
         returns_emb = self.return_emb(returns_to_go.unsqueeze(-1)) + time_emb
 
-        # [batch_size, seq_len * 3, emb_dim], (r_0, s_0, a_0, r_1, s_1, a_1, ...)
         sequence = (
             torch.stack([returns_emb, state_emb, act_emb], dim=1)
             .permute(0, 2, 1, 3)
             .reshape(batch_size, 3 * seq_len, self.embedding_dim)
         )
         if padding_mask is not None:
-            # [batch_size, seq_len * 3], stack mask identically to fit the sequence
             padding_mask = (
                 torch.stack([padding_mask, padding_mask, padding_mask], dim=1)
                 .permute(0, 2, 1)
                 .reshape(batch_size, 3 * seq_len)
             )
-        # LayerNorm and Dropout (!!!) as in original implementation,
-        # while minGPT & huggingface uses only embedding dropout
         out = self.emb_norm(sequence)
         out = self.emb_drop(out)
         for block in self.blocks:
             out = block(out)
 
         out = self.out_norm(out)
-        # [batch_size, seq_len, action_dim]
-        # predict actions only from state embeddings
         out = self.action_head(out[:, 1::3]) * self.max_action
 
         return out
 
 
-# Training and evaluation logic
 @torch.no_grad()
 def eval_rollout(
     model: DecisionRWKV,
@@ -518,7 +492,6 @@ def eval_rollout(
     states = torch.zeros(
         1, model.episode_len + 1, model.state_dim, dtype=torch.float, device=device
     )
-
     actions = torch.zeros(
         1, model.episode_len, model.action_dim, dtype=torch.float, device=device
     )
@@ -529,23 +502,17 @@ def eval_rollout(
     states[:, 0] = torch.as_tensor(env.reset(), device=device)
     returns[:, 0] = torch.as_tensor(target_return, device=device)
 
-    # cannot step higher than model episode len, as timestep embeddings will crash
     episode_return, episode_len = 0.0, 0.0
     for step in range(model.episode_len):
-        # first select history up to step, then select last seq_len states,
-        # step + 1 as : operator is not inclusive, last action is dummy with zeros
-        # (as model will predict last, actual last values are not important)
 
-        predicted_actions = model(  # fix this noqa!!!
+        predicted_actions = model( 
             states[:, : step + 1][:, -model.seq_len :],
             actions[:, : step + 1][:, -model.seq_len :],
             returns[:, : step + 1][:, -model.seq_len :],
             time_steps[:, : step + 1][:, -model.seq_len :],
         )
-
         predicted_action = predicted_actions[0, -1].cpu().numpy()
         next_state, reward, done, info = env.step(predicted_action)
-        # at step t, we predict a_t, get s_{t + 1}, r_{t + 1}
         actions[:, step] = torch.as_tensor(predicted_action)
         states[:, step + 1] = torch.as_tensor(next_state)
         returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
@@ -561,11 +528,10 @@ def eval_rollout(
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
-    # init wandb session for logging
+    set_seed(TrainConfig.train_seed, deterministic_torch=config.deterministic_torch)
     wandb_init(asdict(config))
+    config.env_name = TrainConfig.env_name
 
-    # data & dataloader setup
     dataset = SequenceDataset(
         config.env_name, seq_len=config.seq_len, reward_scale=config.reward_scale
     )
@@ -575,14 +541,12 @@ def train(config: TrainConfig):
         pin_memory=True,
         num_workers=config.num_workers,
     )
-    # evaluation environment with state & reward preprocessing (as in dataset above)
     eval_env = wrap_env(
         env=gym.make(config.env_name),
         state_mean=dataset.state_mean,
         state_std=dataset.state_std,
         reward_scale=config.reward_scale,
     )
-    # model & optimizer & scheduler setup
     config.state_dim = eval_env.observation_space.shape[0]
     config.action_dim = eval_env.action_space.shape[0]
     model = DecisionRWKV(
@@ -609,7 +573,6 @@ def train(config: TrainConfig):
         optim,
         lambda steps: min((steps + 1) / config.warmup_steps, 1),
     )
-    # save config to the checkpoint
     if config.checkpoints_path is not None:
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
@@ -621,8 +584,6 @@ def train(config: TrainConfig):
     for step in trange(config.update_steps, desc="Training"):
         batch = next(trainloader_iter)
         states, actions, returns, time_steps, mask = [b.to(config.device) for b in batch]
-
-        # True value indicates that the corresponding key value will be ignored
         padding_mask = ~mask.to(torch.bool)
 
         predicted_actions = model(
@@ -633,7 +594,6 @@ def train(config: TrainConfig):
             padding_mask=padding_mask,
         )
         loss = F.mse_loss(predicted_actions, actions.detach(), reduction="none")
-        # [batch_size, seq_len, action_dim] * [batch_size, seq_len, 1]
         loss = (loss * mask.unsqueeze(-1)).mean()
 
         optim.zero_grad()
@@ -651,15 +611,57 @@ def train(config: TrainConfig):
             step=step,
         )
 
-        # validation in the env for the actual online performance
+        if step % config.eval_every == 0 or step == config.update_steps - 1:
+            model.eval()
+            target_return = config.target_return
+            eval_env.seed(config.eval_seed)
+            eval_returns = []
+            for _ in trange(config.eval_episodes, desc="Evaluation", leave=False):
+                eval_return, eval_len = eval_rollout(
+                    model=model,
+                    env=eval_env,
+                    target_return=target_return * config.reward_scale,
+                    device=config.device,
+                )
+                eval_returns.append(eval_return / config.reward_scale)
 
+            normalized_scores = (
+                eval_env.get_normalized_score(np.array(eval_returns)) * 100
+            )
+            wandb.log(
+                {
+                    f"eval/{target_return}_return_mean": np.mean(eval_returns),
+                    f"eval/{target_return}_return_std": np.std(eval_returns),
+                    f"eval/{target_return}_normalized_score_mean": np.mean(
+                        normalized_scores
+                    ),
+                    f"eval/{target_return}_normalized_score_std": np.std(
+                        normalized_scores
+                    ),
+                },
+                step=step,
+            )
+            model.train()
 
     if config.checkpoints_path is not None:
+        checkpoint = {
+            "model_state": model.state_dict(),
+            "state_mean": dataset.state_mean,
+            "state_std": dataset.state_std,
+        }
+        torch.save(checkpoint, os.path.join(config.checkpoints_path, "dt_checkpoint.pt"))
 
-        torch.save(model.state_dict(), os.path.join(config.checkpoints_path, "dt_checkpoint.pt"))
-        print("saving....checkpoint in" + os.path.join(config.checkpoints_path, "dt_checkpoint.pt"))
 
+def trainConfig(env_name,seed):
+    TrainConfig.env_name = env_name
+    TrainConfig.train_seed = seed
+    train()
 
 
 if __name__ == "__main__":
-    train()
+    envs = ["halfcheetah-medium-v2","halfcheetah-medium-replay-v2","halfcheetah-medium-expert-v2","hopper-medium-v2","hopper-medium-replay-v2","hopper-medium-expert-v2","walker2d-medium-v2","walker2d-medium-replay-v2","walker2d-medium-expert-v2"]
+    seeds = [0,10,42]
+
+    for env in envs:
+        for seed in seeds:
+            trainConfig(env,seed)

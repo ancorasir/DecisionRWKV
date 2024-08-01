@@ -1,5 +1,8 @@
 # DecisionRWKV
 
+![gif info](media/gif-Introduction.gif)
+
+
 ## Overview
 Models based on the Transformer architecture have seen widespread application across
 fields such as natural language processing, computer vision, and robotics, with large

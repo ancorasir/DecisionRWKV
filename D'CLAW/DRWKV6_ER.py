@@ -5,6 +5,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Any, DefaultDict, Dict, List, Optional, Tuple, Union
+
 import robel
 import gym
 import numpy as np
@@ -13,27 +14,12 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, IterableDataset
-from tqdm.auto import tqdm, trange  
+from tqdm.auto import tqdm, trange
+
 import pickle
 import matplotlib.pyplot as plt
-import numpy as np
-import os
-import random
-import uuid
-from collections import defaultdict
-from dataclasses import asdict, dataclass
-from typing import Any, DefaultDict, Dict, List, Optional, Tuple, Union
-
-import d4rl  
-import gym
-import numpy as np
-import pyrallis
-import torch
-import torch.nn as nn
+import d4rl
 import wandb
-from torch.nn import functional as F
-from torch.utils.data import DataLoader, IterableDataset
-from tqdm.auto import tqdm, trange  
 
 class L2Wrap(torch.autograd.Function):
     @staticmethod
@@ -68,11 +54,9 @@ wkv6_cuda = load(name="wkv6", sources=["cuda/wkv6_op.cpp", f"cuda/wkv6_cuda.cu"]
 
 @dataclass
 class TrainConfig:
-    # wandb params
     project: str = "D-RWKV"
     group: str = "Gym-MuJoCo"
     name: str = "DRWKV6-DCLAW"
-    # model params
     embedding_dim: int = 128
     num_layers: int = 12
     num_heads: int = 1
@@ -82,7 +66,6 @@ class TrainConfig:
     residual_dropout: float = 0.1
     embedding_dropout: float = 0.1
     max_action: float = 1.0
-    # training params
     env_name: str = "LRL"
     learning_rate: float = 1e-4
     betas: Tuple[float, float] = (0.9, 0.999)
@@ -93,12 +76,10 @@ class TrainConfig:
     warmup_steps: int = 1000
     reward_scale: float = 1  
     num_workers: int = 4
-    # evaluation params
 
     eval_episodes: int = 1
     eval_every: int = 20000
-    # general params
-    checkpoints_path: Optional[str] = "/home/dong/LRL/dclaw/dclawModel"
+    checkpoints_path: Optional[str] = None
     deterministic_torch: bool = False
     train_seed: int = 0
     eval_seed: int = 10
@@ -264,7 +245,7 @@ class RWKV_ChannelMix(torch.jit.ScriptModule):
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
 
         with torch.no_grad():  
-            ratio_1_to_almost0 = (1.0 - (layer_id / TrainConfig.num_layers))  # 1 to ~0
+            ratio_1_to_almost0 = (1.0 - (layer_id / TrainConfig.num_layers)) 
 
             x = torch.ones(1, 1, TrainConfig.embedding_dim)
             for i in range(TrainConfig.embedding_dim):
@@ -428,7 +409,6 @@ class DecisionRWKV(nn.Module):
         self.emb_norm = nn.LayerNorm(embedding_dim)
 
         self.out_norm = nn.LayerNorm(embedding_dim)
-        # additional seq_len embeddings for padding timesteps
         self.timestep_emb = nn.Embedding(episode_len + seq_len, embedding_dim)
         self.state_emb = nn.Linear(state_dim, embedding_dim)
         self.action_emb = nn.Linear(action_dim, embedding_dim)
@@ -458,28 +438,24 @@ class DecisionRWKV(nn.Module):
 
     def forward(
         self,
-        states: torch.Tensor,  # [batch_size, seq_len, state_dim]
-        actions: torch.Tensor,  # [batch_size, seq_len, action_dim]
-        returns_to_go: torch.Tensor,  # [batch_size, seq_len]
-        time_steps: torch.Tensor,  # [batch_size, seq_len]
-        padding_mask: Optional[torch.Tensor] = None,  # [batch_size, seq_len]
+        states: torch.Tensor,  
+        actions: torch.Tensor,  
+        returns_to_go: torch.Tensor,  
+        time_steps: torch.Tensor,  
+        padding_mask: Optional[torch.Tensor] = None,  
     ) -> torch.FloatTensor:
         batch_size, seq_len = states.shape[0], states.shape[1]
-        # [batch_size, seq_len, emb_dim]
         time_emb = self.timestep_emb(time_steps)
-        # print(states)
         state_emb = self.state_emb(states) + time_emb
         act_emb = self.action_emb(actions) + time_emb
         returns_emb = self.return_emb(returns_to_go.unsqueeze(-1)) + time_emb
 
-        # [batch_size, seq_len * 3, emb_dim], (r_0, s_0, a_0, r_1, s_1, a_1, ...)
         sequence = (
             torch.stack([returns_emb, state_emb, act_emb], dim=1)
             .permute(0, 2, 1, 3)
             .reshape(batch_size, 3 * seq_len, self.embedding_dim)
         )
         if padding_mask is not None:
-            # [batch_size, seq_len * 3], stack mask identically to fit the sequence
             padding_mask = (
                 torch.stack([padding_mask, padding_mask, padding_mask], dim=1)
                 .permute(0, 2, 1)
@@ -532,7 +508,6 @@ def eval_rollout(
         next_state, reward, done, info = env.step(predicted_action)
 
         score += reward
-        # env.render()
 
         actions[:, step] = torch.as_tensor(predicted_action)
         states[:, step + 1] = torch.as_tensor(next_state)
@@ -675,7 +650,6 @@ def train_all(config: TrainConfig):
     set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
     config.state_dim = 21
     config.action_dim = 9
-    # Initialize the model once and train on multiple environments
     model = DecisionRWKV(
         state_dim=config.state_dim,
         action_dim=config.action_dim,
@@ -689,7 +663,6 @@ def train_all(config: TrainConfig):
         embedding_dropout=config.embedding_dropout,
         max_action=config.max_action,
     ).to(config.device)
-    # Train on each environment in the list
     env_list = ["DClawTurnFixedT0-v0", "DClawTurnFixedT1-v0", "DClawTurnFixedT2-v0", "DClawTurnFixedT3-v0",
                 "DClawTurnFixedT4-v0", "DClawTurnFixedT5-v0", "DClawTurnFixedT6-v0", "DClawTurnFixedT7-v0",
                 "DClawTurnFixedT8-v0", "DClawTurnFixedT9-v0"]
